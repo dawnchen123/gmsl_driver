@@ -1,5 +1,5 @@
 /*
- * Optimized nvCam with CUDA Streams for Parallel Execution
+ * Optimized nvCam implementation with CUDA acceleration and Dynamic Distortion Correction
  */
 #pragma once
 
@@ -7,6 +7,7 @@
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
+#include <opencv2/calib3d.hpp>
 #include <opencv2/opencv.hpp>
 #include <stdio.h>
 #include <unistd.h>
@@ -34,20 +35,17 @@
 
 using namespace std;
 
+// Global statics (Legacy support)
 static std::mutex m_mtx[8];
 static std::condition_variable con[8];
 static std::mutex changeszmtx;
-
-// Camera calibration data
-static cv::Mat intrinsic_matrix[4];
-static cv::Mat distortion_coeffs[4];
-static std::vector<std::vector<int>> rectPara(4);
 
 // V4L2 Helpers
 static bool camera_initialize(camcontext_t * ctx) {
     struct v4l2_format fmt;
     ctx->cam_fd = open(ctx->dev_name, O_RDWR);
-    if (ctx->cam_fd == -1) return false;
+    if (ctx->cam_fd == -1)
+        return false;
 
     memset(&fmt, 0, sizeof(fmt));
     fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -132,22 +130,16 @@ static bool stop_stream(camcontext_t * ctx) {
 class nvCam
 {
 public:
-    nvCam(stCamCfg &camcfg):
+    // Constructor updated to accept Camera Matrix (K) and Distortion Coeffs (D)
+    nvCam(stCamCfg &camcfg, const cv::Mat& K, const cv::Mat& D):
+        // [Forced Modification]: Hardcode 1920x1080 resolution
         m_camSrcWidth(1920),
         m_camSrcHeight(1080),
-        m_retWidth(camcfg.retWidth),
-        m_retHeight(camcfg.retHeight),
-        m_undistoredWidth(camcfg.undistoredWidth),
-        m_undistoredHeight(camcfg.undistoredHeight), 
-        m_id(camcfg.id),
-        m_undistor(camcfg.undistor)
+        m_retWidth(1920), // Keep output at 1080p
+        m_retHeight(1080),
+        m_id(camcfg.id)
     {
-        int idx = 0; 
-        // Calibration data for 1080p
-        intrinsic_matrix[idx] = (cv::Mat_<double>(3,3) << 2075.7, 0, 947.9, 0, 2066.5, 567.7, 0, 0, 1);
-        distortion_coeffs[idx] = (cv::Mat_<double>(1,4) << -0.6183, 0.3355, 0, 0);
-        rectPara[idx] = vector<int>{69,103,1782,889};
-
+        // V4L2 Context Setup
         memset(&ctx, 0, sizeof(camcontext_t));
         strcpy(ctx.dev_name, camcfg.name);
         ctx.cam_pixfmt = V4L2_PIX_FMT_YUYV;
@@ -159,6 +151,7 @@ public:
         if (!prepare_buffers(&ctx)) spdlog::critical("Cam {} Buffer Prep Failed", m_id);
         if (!start_stream(&ctx)) spdlog::critical("Cam {} Stream Start Failed", m_id);
 
+        // NvBuffer for Color Conversion (YUYV -> ARGB)
         NvBufferCreateParams bufparams = {0};
         retNvbuf = (nv_buffer *)malloc(sizeof(nv_buffer));
         bufparams.payloadType = NvBufferPayload_SurfArray;
@@ -169,31 +162,43 @@ public:
         bufparams.nvbuf_tag = NvBufferTag_NONE;
         NvBufferCreateEx(&retNvbuf->dmabuff_fd, &bufparams);
 
+        // Initialize Transform Params
         memset(&transParams, 0, sizeof(transParams));
         transParams.transform_flag = NVBUFFER_TRANSFORM_FILTER;
         transParams.transform_filter = NvBufferTransform_Filter_Smart;
 
+        // Initialize CPU Mats
         m_argb = cv::Mat(m_camSrcHeight, m_camSrcWidth, CV_8UC4);
         m_ret = cv::Mat(m_retHeight, m_retWidth, CV_8UC3);
 
-        // GPU Resources
+        // Initialize GPU Mats
         m_gpuargb = cv::cuda::GpuMat(m_camSrcHeight, m_camSrcWidth, CV_8UC4);
-        m_gpuDistoredImg = cv::cuda::GpuMat(m_undistoredHeight, m_undistoredWidth, CV_8UC4); 
-        m_gpuUndistoredImg = cv::cuda::GpuMat(m_undistoredHeight, m_undistoredWidth, CV_8UC3); 
-        m_gpuret = cv::cuda::GpuMat(m_retHeight, m_retWidth, CV_8UC3); 
-
-        // Precompute Maps and upload to GPU
-        cv::Size image_size(m_camSrcWidth, m_camSrcHeight);
-        cv::Size undistorSize(m_undistoredWidth, m_undistoredHeight);
-        cv::Mat R = cv::Mat::eye(3,3,CV_32F);
-        cv::Mat mapx_cpu, mapy_cpu;
-        cv::Mat optMatrix = cv::getOptimalNewCameraMatrix(intrinsic_matrix[idx], distortion_coeffs[idx], image_size, 1, undistorSize, 0);
-        cv::initUndistortRectifyMap(intrinsic_matrix[idx], distortion_coeffs[idx], R, optMatrix, undistorSize, CV_32FC1, mapx_cpu, mapy_cpu);
+        m_gpuret = cv::cuda::GpuMat(m_retHeight, m_retWidth, CV_8UC3); // Final result
+        m_gpuRGB = cv::cuda::GpuMat(m_camSrcHeight, m_camSrcWidth, CV_8UC3); // Intermediate RGB
         
-        gpuMapx.upload(mapx_cpu);
-        gpuMapy.upload(mapy_cpu);
-
-        spdlog::info("Camera {} Initialized (1080p, CUDA Streams)", m_id);
+        // ---------------------------------------------------------
+        // Efficient Distortion Correction Setup
+        // ---------------------------------------------------------
+        if(!K.empty() && !D.empty()) {
+            m_undistor = true;
+            cv::Size image_size(m_camSrcWidth, m_camSrcHeight);
+            cv::Mat R = cv::Mat::eye(3,3,CV_32F);
+            cv::Mat mapx_cpu, mapy_cpu;
+            
+            // getOptimalNewCameraMatrix with alpha=0 crops the image to remove black borders
+            // This ensures the output image contains only valid pixels from the camera
+            cv::Mat optMatrix = cv::getOptimalNewCameraMatrix(K, D, image_size, 0, image_size, 0);
+            
+            // Compute the remap maps once (CPU) and upload to GPU
+            cv::initUndistortRectifyMap(K, D, R, optMatrix, image_size, CV_32FC1, mapx_cpu, mapy_cpu);
+            
+            gpuMapx.upload(mapx_cpu);
+            gpuMapy.upload(mapy_cpu);
+            spdlog::info("Camera {} Distortion Maps Generated and Uploaded to GPU", m_id);
+        } else {
+            m_undistor = false;
+            spdlog::warn("Camera {} Missing Intrinsics (K/D empty). Undistortion Disabled.", m_id);
+        }
     }
 
     ~nvCam() {
@@ -207,7 +212,7 @@ public:
         NvBufferDestroy(retNvbuf->dmabuff_fd);
     }
 
-    // [Optimization]: Use ros::Time to capture timestamp as close to hardware event as possible
+    // Reads frame, undistorts on GPU, and returns CPU Mat
     bool read_frame(ros::Time& capture_time)
     {
         struct v4l2_buffer v4l2_buf;
@@ -215,67 +220,49 @@ public:
         v4l2_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
         v4l2_buf.memory = V4L2_MEMORY_DMABUF;
 
-        // [BLOCKING]: Waits here until hardware interrupt says frame is ready
-        // Since we have 4 threads, all 4 will wake up almost simultaneously here.
+        // [BLOCKING] Wait for hardware frame
         if (ioctl(ctx.cam_fd, VIDIOC_DQBUF, &v4l2_buf) < 0) {
             spdlog::error("Cam {} DQBUF failed", m_id);
             return false;
         }
         
-        // [Optimization]: Capture timestamp immediately after wake-up
         capture_time = ros::Time::now();
 
+        // [Hardware VIC] Convert YUYV to ARGB (Zero copy relative to CPU)
         if (-1 == NvBufferTransform(ctx.g_buff[v4l2_buf.index].dmabuff_fd, retNvbuf->dmabuff_fd, &transParams)) {
             return false;
         }
 
+        // [Bottleneck] Map/Copy NvBuffer to CPU accessible memory
+        // This is currently necessary to get data into a standard cv::Mat/GpuMat pipeline 
+        // without complex EGL interop. NvBuffer2Raw is robust.
         NvBuffer2Raw(retNvbuf->dmabuff_fd, 0, m_camSrcWidth, m_camSrcHeight, m_argb.data);
 
+        // Return buffer to driver ASAP
         if (ioctl(ctx.cam_fd, VIDIOC_QBUF, &v4l2_buf)) {
             spdlog::error("QBUF failed");
         }
 
-        // [Optimization]: GPU Parallelism using Streams
-        // Passing m_stream to all CUDA functions allows GPU to schedule 4 cameras concurrently
+        // [GPU Acceleration]
         try {
+            // 1. Upload to GPU (ARGB)
             m_gpuargb.upload(m_argb, m_stream); 
 
             if(m_undistor) {
-                // Resize/Copy
-                if (m_camSrcWidth != m_undistoredWidth)
-                    cv::cuda::resize(m_gpuargb, m_gpuDistoredImg, cv::Size(m_undistoredWidth, m_undistoredHeight), 0, 0, cv::INTER_LINEAR, m_stream);
-                else
-                    m_gpuargb.copyTo(m_gpuDistoredImg, m_stream);
+                // 2. Convert ARGB -> RGB (Async)
+                // Remap requires RGB or specific types, and final output should be RGB for ROS
+                cv::cuda::cvtColor(m_gpuargb, m_gpuRGB, cv::COLOR_RGBA2RGB, 0, m_stream);
 
-                // Convert to RGB (async)
-                cv::cuda::GpuMat m_gpuRGB; 
-                cv::cuda::cvtColor(m_gpuDistoredImg, m_gpuRGB, cv::COLOR_RGBA2RGB, 0, m_stream);
-
-                // Remap (async)
-                cv::cuda::remap(m_gpuRGB, m_gpuUndistoredImg, gpuMapx, gpuMapy, cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(), m_stream);
-
-                // Crop & Final Resize
-                int idx = 0;
-                cv::Rect crop(rectPara[idx][0], rectPara[idx][1], rectPara[idx][2], rectPara[idx][3]);
-                crop = crop & cv::Rect(0, 0, m_gpuUndistoredImg.cols, m_gpuUndistoredImg.rows);
+                // 3. Remap (Undistort) (Async)
+                // This is the most efficient way to undistort on GPU using precomputed maps
+                cv::cuda::remap(m_gpuRGB, m_gpuret, gpuMapx, gpuMapy, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(), m_stream);
                 
-                auto cropped_gpu = m_gpuUndistoredImg(crop);
-                cv::cuda::resize(cropped_gpu, m_gpuret, cv::Size(m_retWidth, m_retHeight), 0, 0, cv::INTER_LINEAR, m_stream);
-
             } else {
-                // Simple conversion pipeline (async)
+                // Just convert to RGB if no undistortion
                 cv::cuda::cvtColor(m_gpuargb, m_gpuret, cv::COLOR_RGBA2RGB, 0, m_stream);
-                if (m_gpuret.cols != m_retWidth || m_gpuret.rows != m_retHeight) {
-                   // Need a temp buffer for resize src/dst if they are same object in some contexts, but here m_gpuret is dst
-                   // To be safe, we can just resize in place if size differs
-                   cv::cuda::GpuMat temp;
-                   m_gpuret.copyTo(temp, m_stream);
-                   cv::cuda::resize(temp, m_gpuret, cv::Size(m_retWidth, m_retHeight), 0, 0, cv::INTER_LINEAR, m_stream);
-                }
             }
 
-            // [Optimization]: Download is the sync point. 
-            // We wait for the specific stream to finish.
+            // 4. Download to CPU (Blocking wait for stream)
             m_gpuret.download(m_ret, m_stream);
             m_stream.waitForCompletion(); 
 
@@ -286,12 +273,11 @@ public:
 
         return true;
     }
- 
+
 public:
     camcontext_t ctx;
     int m_camSrcWidth, m_camSrcHeight;
     int m_retWidth, m_retHeight;
-    int m_undistoredWidth, m_undistoredHeight;
     int m_id;
     bool m_undistor;
 
@@ -300,12 +286,10 @@ public:
 
     cv::Mat m_argb, m_ret;
     
-    // [Optimization]: Each camera gets its own CUDA stream
+    // CUDA resources
     cv::cuda::Stream m_stream;
-
     cv::cuda::GpuMat m_gpuargb;
-    cv::cuda::GpuMat m_gpuDistoredImg;
-    cv::cuda::GpuMat m_gpuUndistoredImg;
+    cv::cuda::GpuMat m_gpuRGB; 
     cv::cuda::GpuMat m_gpuret;
     cv::cuda::GpuMat gpuMapx, gpuMapy;
 };

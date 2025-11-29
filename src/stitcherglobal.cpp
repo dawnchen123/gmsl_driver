@@ -7,8 +7,8 @@ int camSrcHeight = 1080; // Default changed to 1080
 int distorWidth =  1920;
 int distorHeight = 1080;
 
-int undistorWidth =  1920; //960
-int undistorHeight = 1080; //540
+int undistorWidth =  1920; 
+int undistorHeight = 1080; 
 
 int stitcherinputWidth = 1920;
 int stitcherinputHeight = 1080;
@@ -26,7 +26,7 @@ int renderBufHeight = 1080;
 // [Modification]: Set used camera number to 4
 int USED_CAMERA_NUM = 4;
 
-bool undistor = false;
+bool undistor = true; // Default enable undistortion since we want it by default now
 
 float stitcherMatchConf = 0.3;
 float stitcherAdjusterConf = 0.7f;
